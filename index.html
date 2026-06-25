@@ -715,7 +715,7 @@ function initPlanState(chatMode){
   if(chatMode === 'gaokao'){
     return {
       mode:'gaokao',
-      collected:{province:'',rank:0,score:0,subject:'',majors:[],major_unknown:false,schools:[],accept_adjustment:null,region_pref:[],region_avoid:[],career_goal:'',budget:''},
+      collected:{province:'',rank:0,score:0,subject:'',subject_detail:[],majors:[],major_unknown:false,schools:[],accept_adjustment:null,region_pref:[],region_avoid:[],career_goal:'',budget:''},
       asked_fields:[],
       asked_count:{},
       current_questions:[],
@@ -855,9 +855,14 @@ function serializeChats(){
 }
 
 function save(){
-  localStorage.setItem('xf_chats', JSON.stringify(serializeChats()));
-  localStorage.setItem('xf_cur', curId || '');
-  localStorage.setItem('xf_mode', mode);
+  try{
+    var data = JSON.stringify(serializeChats());
+    localStorage.setItem('xf_chats', data);
+    localStorage.setItem('xf_cur', curId || '');
+    localStorage.setItem('xf_mode', mode);
+  }catch(e){
+    console.warn('保存聊天记录失败，可能是存储空间满了。', e);
+  }
 }
 
 function getCfg(){

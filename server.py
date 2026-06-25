@@ -11,6 +11,8 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
@@ -52,11 +54,34 @@ MODEL_ALIASES = {
 }
 
 SUBJECT_DETAIL_KEYWORDS = ["物理", "历史", "化学", "生物", "政治", "地理"]
+REQUIREMENT_HINTS = ["选考", "选科", "首选", "再选", "科目要求", "专业要求", "限选", "须选", "要求"]
+REPLACE_LIST_FIELDS = {"subject_detail", "majors", "schools", "region_pref", "region_avoid", "guardrails"}
+MAJOR_SEARCH_ALIASES = {
+    "计算机": ["计算机", "计算机类", "计算机科学与技术", "软件", "软件工程", "人工智能", "大数据", "数据科学", "信息安全", "网络工程", "物联网"],
+    "软件": ["软件", "软件工程", "计算机", "程序设计"],
+    "人工智能": ["人工智能", "智能科学", "数据科学", "计算机", "软件"],
+    "法学": ["法学", "法律", "法治", "涉外法治", "司法", "知识产权"],
+    "医学": ["医学", "临床", "口腔", "预防医学", "基础医学"],
+    "金融": ["金融", "经济", "经济学", "财政", "会计", "财务"],
+}
+SUBJECT_DETAIL_ABBR_MAP = {
+    "物化地": ["物理", "化学", "地理"],
+    "物化政": ["物理", "化学", "政治"],
+    "物化生": ["物理", "化学", "生物"],
+    "物生地": ["物理", "生物", "地理"],
+    "物生政": ["物理", "生物", "政治"],
+    "物政地": ["物理", "政治", "地理"],
+    "史政地": ["历史", "政治", "地理"],
+    "史地政": ["历史", "地理", "政治"],
+    "历政地": ["历史", "政治", "地理"],
+    "历地政": ["历史", "地理", "政治"],
+}
 
 GAOKAO_PRIORITY = [
     "province",
     "score_or_rank",
     "subject",
+    "subject_detail",
     "majors",
     "accept_adjustment",
     "region_pref",
@@ -89,6 +114,7 @@ GAOKAO_QUESTION_TEXT = {
     "province": "你是哪个省的考生？",
     "score_or_rank": "告诉我你的分数，或者你的位次，给一个就行。",
     "subject": "你是物理类、历史类，还是像浙江这种综合改革省份？",
+    "subject_detail": "如果你是新高考选科，麻烦再告诉我你的具体组合，比如物化地、物化生、史政地这种。",
     "majors": "你想学什么专业？如果有明确不想学的，也可以一起说。",
     "accept_adjustment": "你能不能接受调剂？能接受、不能接受，直接说就行。",
     "region_pref": "你更想去哪里读书？如果有不想去的城市或省份，也可以顺手告诉我。",
@@ -177,13 +203,29 @@ UNIFIED_EXTRACT_PROMPT = """你是一个只负责信息提取的助手。你的�
 6. accept_adjustment 只能是 true、false 或 null。
 7. score 和 rank 只填数字，没有就填 0。
 8. subject 只允许：物理类、历史类、综合。
-9. career_goal 尽量归一为：考研、直接就业、考公、考编；无法判断就留空。
-10. budget 保留成适合展示的简短中文，比如“正常预算”“预算偏谨慎”“不太高就行”。
-11. majors、schools、region_pref、region_avoid、guardrails 必须是数组。
-12. thinking_mode 固定返回 false。
+9. subject_detail 必须是数组，优先返回更细的选科，如物理、化学、生物、政治、地理、历史。
+10. career_goal 尽量归一为：考研、直接就业、考公、考编；无法判断就留空。
+11. budget 保留成适合展示的简短中文，比如“正常预算”“预算偏谨慎”“不太高就行”。
+12. majors、schools、region_pref、region_avoid、guardrails 必须是数组。
+13. thinking_mode 固定返回 false。
 
 JSON 模板：
-{"province":"","score":0,"rank":0,"subject":"","majors":[],"major_unknown":false,"schools":[],"accept_adjustment":null,"region_pref":[],"region_avoid":[],"career_goal":"","budget":"","topic":"","goal":"","style":"","guardrails":[],"thinking_mode":false}
+{"province":"","score":0,"rank":0,"subject":"","subject_detail":[],"majors":[],"major_unknown":false,"schools":[],"accept_adjustment":null,"region_pref":[],"region_avoid":[],"career_goal":"","budget":"","topic":"","goal":"","style":"","guardrails":[],"thinking_mode":false}
+"""
+
+SEMANTIC_RETRIEVAL_PROMPT = """你是一个志愿检索词补全助手。
+你的任务不是回答用户问题，也不是推荐学校，而是在本地数据库没有直接命中时，帮系统补一些更合适的中文检索词。
+
+输出规则：
+1. 只能输出一个 JSON 对象，不能输出解释，不能输出 Markdown。
+2. terms 必须是数组，返回 0 到 8 个中文短词。
+3. 这些词只能是专业名称、专业大类、专业组方向、学科方向或常见近义叫法。
+4. 不要输出学校名、分数、位次、城市、评价词。
+5. 如果用户表达已经很明确，也可以补充更常见的同类叫法。
+6. 如果实在无法判断，就返回空数组。
+
+JSON 模板：
+{"terms":[],"reason":""}
 """
 
 
@@ -225,70 +267,185 @@ def safe_json_loads(text, fallback=None):
         return fallback
 
 
+def default_subject_detail(subject):
+    if subject == "物理类":
+        return ["物理"]
+    if subject == "历史类":
+        return ["历史"]
+    return []
+
+
+def normalize_category_text(category_raw):
+    category_raw = (category_raw or "").strip()
+    if "物理" in category_raw:
+        return "物理类"
+    if "历史" in category_raw:
+        return "历史类"
+    if "综合" in category_raw:
+        return "综合"
+    return category_raw
+
+
+def build_major_search_terms(major="", keyword=""):
+    raw_terms = []
+    for item in [major] + [part.strip() for part in str(keyword or "").split(",")]:
+        if item:
+            raw_terms.append(str(item).strip())
+    raw_terms = unique_list(raw_terms)
+    expanded = list(raw_terms)
+    for term in raw_terms:
+        compact = term.replace("专业", "").replace("方向", "").replace("类", "").strip()
+        if compact:
+            expanded.append(compact)
+        for key, aliases in MAJOR_SEARCH_ALIASES.items():
+            if key in term or term in aliases:
+                expanded.extend(aliases)
+    return unique_list(expanded)
+
+
+def text_matches_terms(text, terms):
+    text = text or ""
+    return any(term and term in text for term in terms or [])
+
+
+def _col_letter_to_index(col_letters):
+    index = 0
+    for ch in col_letters.upper():
+        index = index * 26 + (ord(ch) - ord("A") + 1)
+    return index - 1
+
+
+def extract_xlsx_rows(path):
+    ns_main = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    ns_rel = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    with zipfile.ZipFile(path) as archive:
+        names = set(archive.namelist())
+        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        sheets = workbook.find(f"{ns_main}sheets")
+        rels = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        rel_map = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels}
+
+        shared = []
+        if "xl/sharedStrings.xml" in names:
+            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in root:
+                texts = []
+                for node in item.iter(f"{ns_main}t"):
+                    texts.append(node.text or "")
+                shared.append("".join(texts))
+
+        first_sheet = None
+        for sheet in sheets or []:
+            name = sheet.attrib.get("name", "")
+            if "说明" in name:
+                continue
+            first_sheet = sheet
+            break
+        if first_sheet is None and sheets is not None and len(sheets):
+            first_sheet = sheets[0]
+        if first_sheet is None:
+            return []
+
+        target = rel_map[first_sheet.attrib[ns_rel + "id"]].lstrip("/")
+        worksheet = ET.fromstring(archive.read(target))
+        rows = []
+        for row in worksheet.iter(f"{ns_main}row"):
+            row_values = []
+            for cell in row.iter(f"{ns_main}c"):
+                cell_ref = cell.attrib.get("r", "")
+                col_match = re.match(r"([A-Z]+)\d+", cell_ref)
+                col_idx = _col_letter_to_index(col_match.group(1)) if col_match else len(row_values)
+                while len(row_values) < col_idx:
+                    row_values.append("")
+                cell_type = cell.attrib.get("t")
+                if cell_type == "inlineStr":
+                    inline = cell.find(f"{ns_main}is")
+                    value = "".join(node.text or "" for node in inline.iter(f"{ns_main}t")) if inline is not None else ""
+                else:
+                    value_node = cell.find(f"{ns_main}v")
+                    value = value_node.text if value_node is not None else ""
+                    if cell_type == "s" and value:
+                        try:
+                            value = shared[int(value)]
+                        except (IndexError, ValueError):
+                            value = ""
+                row_values.append(value)
+            if any(v for v in row_values):
+                rows.append(row_values)
+        return rows
+
+
+def append_user_data_record(school, major, category, province, score, rank, year):
+    if not school or score is None or rank is None:
+        return
+    USER_DATA.append({
+        "school": school,
+        "major": major,
+        "year": year,
+        "category": category,
+        "score": score,
+        "rank": rank,
+        "province": province,
+    })
+
+
+def import_user_rows(rows):
+    for row in rows:
+        if not row or not row[0]:
+            continue
+        school = str(row[0]).strip()
+        if len(school) < 2 or school in ["学校名称", "院校名称"]:
+            continue
+        note = str(row[8]).strip() if len(row) > 8 and row[8] else ""
+        if "示例" in note or "不参与排序" in note:
+            continue
+        major = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+        category = normalize_category_text(str(row[2]).strip() if len(row) > 2 and row[2] else "")
+        province = str(row[3]).strip() if len(row) > 3 and row[3] else ""
+        province = province.replace("省", "").replace("市", "").strip()
+        score_24 = clean_num(row[4] if len(row) > 4 else None)
+        rank_24 = clean_num(row[5] if len(row) > 5 else None)
+        score_25 = clean_num(row[6] if len(row) > 6 else None)
+        rank_25 = clean_num(row[7] if len(row) > 7 else None)
+        if score_24 and score_24 < 100 and rank_24 and rank_24 > 300:
+            score_24, rank_24 = rank_24, score_24
+        if score_25 and score_25 < 100 and rank_25 and rank_25 > 300:
+            score_25, rank_25 = rank_25, score_25
+        append_user_data_record(school, major, category, province, score_24, rank_24, 2024)
+        append_user_data_record(school, major, category, province, score_25, rank_25, 2025)
+
+
+def pick_primary_sheet(workbook):
+    for sheet in workbook.worksheets:
+        if "说明" not in sheet.title:
+            return sheet
+    return workbook.active
+
+
 def load_user_data():
     global USER_DATA
     USER_DATA = []
     if not os.path.exists(USER_XLSX):
+        print(f"[user data] {USER_XLSX} 不存在，跳过自定义数据加载")
         return
+    raw_rows = []
+    loader = "none"
     try:
         import openpyxl
-    except ImportError:
-        return
-
-    try:
         wb = openpyxl.load_workbook(USER_XLSX, data_only=True)
-        for row in wb.active.iter_rows(min_row=2, values_only=True):
-            if not row or not row[0]:
-                continue
-            school = str(row[0]).strip()
-            if len(school) < 2 or school in ["学校名称", "院校名称"]:
-                continue
-            note = str(row[8]).strip() if len(row) > 8 and row[8] else ""
-            if "示例" in note or "不参与排序" in note:
-                continue
-            major = str(row[1]).strip() if len(row) > 1 and row[1] else ""
-            category_raw = str(row[2]).strip() if len(row) > 2 and row[2] else ""
-            if "物理" in category_raw:
-                category = "物理类"
-            elif "历史" in category_raw:
-                category = "历史类"
-            elif "综合" in category_raw:
-                category = "综合"
-            else:
-                category = category_raw
-            province = str(row[3]).strip() if len(row) > 3 and row[3] else ""
-            province = province.replace("省", "").replace("市", "").strip()
-            score_24 = clean_num(row[4] if len(row) > 4 else None)
-            rank_24 = clean_num(row[5] if len(row) > 5 else None)
-            score_25 = clean_num(row[6] if len(row) > 6 else None)
-            rank_25 = clean_num(row[7] if len(row) > 7 else None)
-            if score_24 and score_24 < 100 and rank_24 and rank_24 > 300:
-                score_24, rank_24 = rank_24, score_24
-            if score_25 and score_25 < 100 and rank_25 and rank_25 > 300:
-                score_25, rank_25 = rank_25, score_25
-            if score_24 and rank_24:
-                USER_DATA.append({
-                    "school": school,
-                    "major": major,
-                    "year": 2024,
-                    "category": category,
-                    "score": score_24,
-                    "rank": rank_24,
-                    "province": province,
-                })
-            if score_25 and rank_25:
-                USER_DATA.append({
-                    "school": school,
-                    "major": major,
-                    "year": 2025,
-                    "category": category,
-                    "score": score_25,
-                    "rank": rank_25,
-                    "province": province,
-                })
+        sheet = pick_primary_sheet(wb)
+        raw_rows = list(sheet.iter_rows(min_row=2, values_only=True))
         wb.close()
+        loader = "openpyxl"
     except Exception as exc:
-        print(f"[user data] {exc}")
+        try:
+            raw_rows = extract_xlsx_rows(USER_XLSX)[1:]
+            loader = "xml_fallback"
+        except Exception as fallback_exc:
+            print(f"[user data] openpyxl={exc}; xml_fallback={fallback_exc}")
+    if loader != "none":
+        import_user_rows(raw_rows)
+        print(f"[user data] 已从 {USER_XLSX} 加载 {len(USER_DATA)} 条自定义数据 (loader={loader}, raw_rows={len(raw_rows)})")
 
 
 load_user_data()
@@ -403,27 +560,74 @@ def extract_subject(text):
     for keyword, subject in subject_map.items():
         if keyword in text:
             return subject
+    detail = extract_subject_detail(text)
+    if "物理" in detail and "历史" not in detail:
+        return "物理类"
+    if "历史" in detail and "物理" not in detail:
+        return "历史类"
     return ""
 
 
 def extract_subject_detail(text):
+    text = re.sub(r"(男生|女生)", "", text or "")
     found = []
+    for keyword, subjects in SUBJECT_DETAIL_ABBR_MAP.items():
+        if keyword in text:
+            found.extend(subjects)
     for subject in SUBJECT_DETAIL_KEYWORDS:
-        if subject in (text or ""):
+        if subject in text:
             found.append(subject)
     return unique_list(found)
 
 
+def normalize_category_subject(category):
+    text = (category or "").strip()
+    if not text or text == "综合":
+        return ""
+    if "文科" in text:
+        return "历史类"
+    if "理科" in text:
+        return "物理类"
+    if "首选物理" in text or text == "物理类":
+        return "物理类"
+    if "首选历史" in text or text == "历史类":
+        return "历史类"
+    if "物理" in text and "历史" not in text:
+        return "物理类"
+    if "历史" in text and "物理" not in text:
+        return "历史类"
+    return ""
+
+
 def extract_requirement_subjects(major_name):
+    major_name = major_name or ""
+    if not major_name:
+        return []
+    segments = []
+    for segment in re.findall(r"[（(]([^()（）]{1,40})[)）]", major_name):
+        if any(hint in segment for hint in REQUIREMENT_HINTS):
+            segments.append(segment)
+    if any(hint in major_name for hint in REQUIREMENT_HINTS):
+        segments.append(major_name)
+    if not segments:
+        return []
     found = []
-    for subject in SUBJECT_DETAIL_KEYWORDS:
-        if subject in (major_name or ""):
-            found.append(subject)
+    for segment in segments:
+        for keyword, subjects in SUBJECT_DETAIL_ABBR_MAP.items():
+            if keyword in segment:
+                found.extend(subjects)
+        for subject in SUBJECT_DETAIL_KEYWORDS:
+            if subject in segment:
+                found.append(subject)
     return unique_list(found)
 
 
 def requirement_is_unlimited(major_name):
-    return "不限" in (major_name or "")
+    major_name = major_name or ""
+    if "不限" not in major_name:
+        return False
+    bracket_text = "".join(re.findall(r"[（(]([^()（）]{1,40})[)）]", major_name))
+    return "不限" in bracket_text or any(hint in major_name for hint in REQUIREMENT_HINTS)
 
 
 def is_major_group_text(major_name):
@@ -431,7 +635,11 @@ def is_major_group_text(major_name):
     return bool(text) and not any(major in text for major in MAJORS)
 
 
-def subject_requirement_compatible(subject, subject_detail, major_name):
+def subject_requirement_compatible(subject, subject_detail, category, major_name):
+    category_subject = normalize_category_subject(category)
+    if subject in {"历史类", "物理类"} and category_subject and category_subject != subject:
+        return False
+
     major_name = major_name or ""
     if not major_name:
         return True
@@ -446,6 +654,9 @@ def subject_requirement_compatible(subject, subject_detail, major_name):
     if detail_set:
         return all(item in detail_set for item in required)
 
+    first_subject = "物理" if subject == "物理类" else "历史" if subject == "历史类" else ""
+    if first_subject and all(item == first_subject for item in required):
+        return True
     if subject in {"历史类", "物理类"}:
         return False
     return True
@@ -463,12 +674,35 @@ def extract_province(text):
 
 
 def extract_majors(text):
+    text = re.sub(r"(男生|女生)", "", text or "")
     negative_blocks = re.findall(r"(?:不学|不考虑|拒绝|排斥|不接受|别推荐|不想学).*?(?:[。，,；;\n]|$)", text)
     negative_text = "".join(negative_blocks)
+    ambiguous_patterns = {
+        "化学": r"(?:(?:想|要|准备|考虑|打算)?学|报|读|专业|方向).{0,4}化学|化学(?:专业|类|科学|工程|工艺|师范|教育)",
+        "生物": r"(?:(?:想|要|准备|考虑|打算)?学|报|读|专业|方向).{0,4}生物|生物(?:专业|类|科学|工程|技术|医学)",
+        "地理": r"(?:(?:想|要|准备|考虑|打算)?学|报|读|专业|方向).{0,4}地理|地理(?:专业|类|科学|信息|师范)",
+        "数学": r"(?:(?:想|要|准备|考虑|打算)?学|报|读|专业|方向).{0,4}数学|数学(?:专业|类|科学|师范)",
+        "英语": r"(?:(?:想|要|准备|考虑|打算)?学|报|读|专业|方向).{0,4}英语|英语(?:专业|类|师范)",
+        "日语": r"(?:(?:想|要|准备|考虑|打算)?学|报|读|专业|方向).{0,4}日语|日语(?:专业|类)",
+    }
     found = []
     for major in MAJORS:
-        if major in text and major not in negative_text:
+        if major in negative_text:
+            continue
+        if major in ambiguous_patterns:
+            if re.search(ambiguous_patterns[major], text):
+                found.append(major)
+            continue
+        if major in text:
             found.append(major)
+    for keyword, major in [("律师", "法学"), ("司法", "法学"), ("医生", "医学"), ("医师", "医学"), ("教师", "师范")]:
+        if keyword in text and major not in negative_text:
+            found.append(major)
+    # "老师" 太容易误匹配（"老师说""听老师说"只是指人不是说想当老师）
+    # 只在明确的职业意图语境下才映射到师范
+    teacher_intent = re.search(r"(?:想当|想做|当个?|成为|报考?).{0,4}老师|老师.{0,4}(?:专业|方向|编)", text)
+    if teacher_intent and "师范" not in negative_text:
+        found.append("师范")
     return unique_list(found)
 
 
@@ -589,6 +823,15 @@ def contextual_extract_fields(mode, text, current_questions):
             subject = extract_subject(text)
             if subject:
                 result["subject"] = subject
+                details = extract_subject_detail(text)
+                if details:
+                    result["subject_detail"] = details
+                else:
+                    result["subject_detail"] = default_subject_detail(subject)
+        elif field == "subject_detail":
+            details = extract_subject_detail(text)
+            if details:
+                result["subject_detail"] = details
         elif field == "majors":
             majors = extract_majors(text)
             if majors:
@@ -652,6 +895,7 @@ def extract_info_from_text(text):
         "rank": extract_rank(text),
         "score": extract_score(text),
         "subject": extract_subject(text),
+        "subject_detail": extract_subject_detail(text),
         "majors": extract_majors(text),
         "major_unknown": False,
         "schools": unique_list(schools),
@@ -696,6 +940,7 @@ def fallback_extract_info(mode, text, current_questions=None):
         "score": base.get("score", 0),
         "rank": base.get("rank", 0),
         "subject": base.get("subject", ""),
+        "subject_detail": base.get("subject_detail", []),
         "majors": base.get("majors", []),
         "major_unknown": infer_unknown_major(text),
         "schools": base.get("schools", []),
@@ -715,6 +960,16 @@ def fallback_extract_info(mode, text, current_questions=None):
                 if result.get("rank"):
                     focused["rank"] = result["rank"]
                 continue
+            if field == "subject_detail":
+                if result.get("subject_detail"):
+                    focused["subject_detail"] = result["subject_detail"]
+                continue
+            if field == "subject":
+                if result.get("subject"):
+                    focused["subject"] = result["subject"]
+                if result.get("subject_detail"):
+                    focused["subject_detail"] = result["subject_detail"]
+                continue
             value = result.get(field)
             if isinstance(value, list) and value:
                 focused[field] = value
@@ -725,7 +980,7 @@ def fallback_extract_info(mode, text, current_questions=None):
         if result.get("major_unknown"):
             focused["major_unknown"] = True
         if focused:
-            return focused
+            return merge_collected(result, focused)
     return result
 
 
@@ -751,6 +1006,12 @@ def normalize_extracted_fields(mode, parsed):
         subject = parsed.get("subject", "").strip()
         if subject in {"物理类", "历史类", "综合"}:
             normalized["subject"] = subject
+    if "subject_detail" in parsed and isinstance(parsed.get("subject_detail"), list):
+        normalized["subject_detail"] = unique_list([
+            str(item).strip()
+            for item in parsed.get("subject_detail") or []
+            if str(item).strip() in SUBJECT_DETAIL_KEYWORDS
+        ])
     if "majors" in parsed and isinstance(parsed.get("majors"), list):
         normalized["majors"] = unique_list([str(item).strip() for item in parsed.get("majors") or [] if str(item).strip()])
     if "major_unknown" in parsed:
@@ -820,6 +1081,62 @@ def ai_extract_fields(mode, message, history, current_questions, collected, conf
     return normalize_extracted_fields(mode, parsed)
 
 
+def ai_expand_retrieval_terms(collected, history, config):
+    api_key = (config.get("key") or "").strip()
+    if not api_key:
+        return []
+
+    majors = collected.get("majors") or []
+    if not majors and not collected.get("career_goal"):
+        return []
+
+    api_url = (config.get("url") or "https://api.deepseek.com").strip().rstrip("/")
+    model = normalize_model_name(config.get("model"))
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SEMANTIC_RETRIEVAL_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "province": collected.get("province", ""),
+                        "subject": collected.get("subject", ""),
+                        "subject_detail": collected.get("subject_detail", []),
+                        "majors": majors,
+                        "major_unknown": collected.get("major_unknown", False),
+                        "career_goal": collected.get("career_goal", ""),
+                        "latest_history": (history or [])[-6:],
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": 220,
+        "thinking": {"type": "disabled"},
+    }
+    request = urllib.request.Request(
+        api_url + "/v1/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=35) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+    content = content.replace("```json", "").replace("```", "").strip()
+    parsed = safe_json_loads(content, {})
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("terms"), list):
+        return []
+    terms = unique_list([str(item).strip() for item in parsed.get("terms") or [] if str(item).strip()])
+    banned = {"学校", "大学", "学院", "冲", "稳", "保", "推荐", "志愿", "就业", "考研"}
+    return [term for term in terms if term not in banned][:8]
+
+
 def get_default_collected(mode):
     if mode == "gaokao":
         return {
@@ -827,6 +1144,7 @@ def get_default_collected(mode):
             "rank": 0,
             "score": 0,
             "subject": "",
+            "subject_detail": [],
             "majors": [],
             "major_unknown": False,
             "schools": [],
@@ -846,15 +1164,21 @@ def get_default_collected(mode):
 
 def merge_collected(current, incoming):
     merged = dict(current or {})
-    for key, value in (incoming or {}).items():
+    incoming = incoming or {}
+    for key, value in incoming.items():
         if value is None:
             continue
         if isinstance(value, list):
             if value:
-                merged[key] = unique_list((merged.get(key) or []) + value)
+                if key in REPLACE_LIST_FIELDS:
+                    merged[key] = unique_list(value)
+                else:
+                    merged[key] = unique_list((merged.get(key) or []) + value)
             elif key not in merged:
                 merged[key] = []
         elif isinstance(value, bool):
+            if key == "major_unknown":
+                continue  # 由下方专门的 major/major_unknown 分支处理，避免 False 覆盖已有的 True
             merged[key] = value
         elif isinstance(value, int):
             if value > 0:
@@ -864,6 +1188,17 @@ def merge_collected(current, incoming):
                 merged[key] = value.strip()
         else:
             merged[key] = value
+    if incoming.get("majors"):
+        merged["majors"] = unique_list(incoming.get("majors") or [])
+        merged["major_unknown"] = False
+    elif incoming.get("major_unknown") is True:
+        merged["major_unknown"] = True
+        merged["majors"] = []
+    incoming_subject = (incoming.get("subject") or "").strip() if isinstance(incoming.get("subject"), str) else ""
+    if incoming.get("subject_detail"):
+        merged["subject_detail"] = unique_list(incoming.get("subject_detail") or [])
+    elif incoming_subject:
+        merged["subject_detail"] = default_subject_detail(incoming_subject)
     return merged
 
 
@@ -990,8 +1325,7 @@ def planner_should_ask(mode, plan_enabled, state, message):
     effective_missing = [field for field in missing if not should_skip_field(mode, state, field)]
     if mode == "gaokao":
         core_missing = [field for field in required_fields_for_mode(mode) if field in effective_missing]
-        optional_missing = [field for field in optional_fields_for_mode(mode) if field in effective_missing]
-        return bool(core_missing or optional_missing)
+        return bool(core_missing)
     stripped = message.strip()
     if len(stripped) < 8:
         return bool(effective_missing)
@@ -1002,6 +1336,10 @@ def select_questions(mode, state):
     priority = GAOKAO_PRIORITY if mode == "gaokao" else FUN_PRIORITY
     missing = determine_missing_fields(mode, state["collected"])
     available = [field for field in missing if not should_skip_field(mode, state, field)]
+    if mode == "gaokao":
+        core_available = [field for field in required_fields_for_mode(mode) if field in available]
+        if core_available:
+            available = core_available
     selected = []
     for field in priority:
         if field not in available:
@@ -1011,12 +1349,6 @@ def select_questions(mode, state):
         selected.append(field)
         if len(selected) >= 2:
             break
-    if not selected:
-        for field in priority:
-            if field in available:
-                selected.append(field)
-                if len(selected) >= 1:
-                    break
     return selected
 
 
@@ -1031,9 +1363,102 @@ def build_question_text(mode, fields):
     return "\n".join(lines)
 
 
-def build_question_response(mode, state):
+def ai_followup_question(mode, state, message, history, config):
+    api_key = (config.get("key") or "").strip()
+    if not api_key:
+        return None
+    api_url = (config.get("url") or "https://api.deepseek.com").strip().rstrip("/")
+    model = normalize_model_name(config.get("model"))
+    allowed_fields = (
+        "province、score_or_rank、subject、subject_detail、majors、accept_adjustment、region_pref、career_goal、budget"
+        if mode == "gaokao"
+        else "topic、goal、style、guardrails"
+    )
+    prompt = f"""你是一个追问助手。你的任务是基于当前已知信息，生成1到2个最关键的中文追问。
+输出规则：
+1. 只能输出JSON对象。
+2. fields 必须是数组，最多2个，只能从 {allowed_fields} 中选择。
+3. question 必须是给用户看的中文追问，尽量短，一次只问1到2个问题。
+4. 不要重复 collected 里已经明确有值的信息。
+5. 如果当前信息已经足够，不要乱问，fields 设为空数组，question 设为空字符串。
+JSON模板：{{"fields":[],"question":""}}"""
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "mode": mode,
+                        "message": message,
+                        "collected": state.get("collected") or {},
+                        "asked_fields": state.get("asked_fields") or [],
+                        "current_questions": state.get("current_questions") or [],
+                        "missing_fields": determine_missing_fields(mode, state.get("collected") or {}),
+                        "history": history[-8:] if isinstance(history, list) else [],
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": 220,
+        "thinking": {"type": "disabled"},
+    }
+    request = urllib.request.Request(
+        api_url + "/v1/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=35) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+    content = content.replace("```json", "").replace("```", "").strip()
+    parsed = safe_json_loads(content, {})
+    fields = []
+    if isinstance(parsed, dict) and isinstance(parsed.get("fields"), list):
+        fields = [str(item).strip() for item in parsed.get("fields") or [] if str(item).strip()]
+    fields = [field for field in fields if field in GAOKAO_PRIORITY or field in FUN_PRIORITY]
+    question = ""
+    if isinstance(parsed, dict) and isinstance(parsed.get("question"), str):
+        question = parsed.get("question", "").strip()
+    if not question:
+        question = build_question_text(mode, fields[:2] or select_questions(mode, state)[:1])
+    return {
+        "fields": fields[:2],
+        "question": question,
+    }
+
+
+def build_question_response(mode, state, config=None, history=None, message=""):
     state = sanitize_plan_state(mode, state)
     fields = select_questions(mode, state)
+    if not fields:
+        ai_question = ai_followup_question(mode, state, message, history or [], config or {})
+        if ai_question and ai_question.get("question"):
+            fields = ai_question.get("fields") or []
+            state["asked_fields"] = unique_list(state["asked_fields"] + fields)
+            asked_count = dict(state.get("asked_count") or {})
+            for field in fields:
+                asked_count[field] = int(asked_count.get(field, 0)) + 1
+            state["asked_count"] = asked_count
+            state["current_questions"] = fields
+            state["ready"] = False
+            return {
+                "type": "question",
+                "text": ai_question["question"],
+                "planState": sanitize_plan_state(mode, state),
+                "missing_fields": determine_missing_fields(mode, state["collected"]),
+            }
+
+    if not fields:
+        fields = determine_missing_fields(mode, state["collected"])[:1]
+
     state["asked_fields"] = unique_list(state["asked_fields"] + fields)
     asked_count = dict(state.get("asked_count") or {})
     for field in fields:
@@ -1049,8 +1474,33 @@ def build_question_response(mode, state):
     }
 
 
-def recommend_by_user_data(province):
-    matched = [row for row in USER_DATA if row.get("province") and row["province"] in province and row.get("score") and row.get("rank")]
+def recommend_by_user_data(province, major="", keyword="", subject="", subject_detail=None):
+    subject_detail = subject_detail or []
+    province_rows = []
+    for row in USER_DATA:
+        if not row.get("province") or row["province"] not in province:
+            continue
+        if row.get("score") is None or row.get("rank") is None:
+            continue
+        if subject and not subject_requirement_compatible(subject, subject_detail, row.get("category"), row.get("major")):
+            continue
+        province_rows.append(row)
+    if not province_rows:
+        return None
+
+    exact_terms = unique_list([term for term in [major] + str(keyword or "").split(",") if str(term).strip()])
+    relaxed_terms = build_major_search_terms(major=major, keyword=keyword)
+
+    matched = [row for row in province_rows if text_matches_terms((row.get("major") or "") + " " + (row.get("school") or ""), exact_terms)]
+    match_mode = "exact" if matched else ""
+    if not matched and relaxed_terms:
+        matched = [row for row in province_rows if text_matches_terms((row.get("major") or "") + " " + (row.get("school") or ""), relaxed_terms)]
+        match_mode = "semantic" if matched else ""
+    if not matched:
+        if exact_terms or relaxed_terms:
+            return None
+        matched = list(province_rows)
+        match_mode = "province"
     if not matched:
         return None
     grouped = {}
@@ -1096,39 +1546,116 @@ def recommend_by_user_data(province):
         "wen": all_rows[split_1:split_2],
         "bao": all_rows[split_2:],
         "source": "custom_only",
+        "match_mode": match_mode or "province",
+        "semantic_terms": [],
     }
 
 
-def recommend_data(province="", major="", keyword="", rank=0, score=0, subject=""):
+def bucket_rows_for_target(rows, rank=0, score=0):
+    rows = list(rows or [])
+    if not rows:
+        return [], [], []
+    if rank > 0 and any((row.get("rank") or 0) > 0 for row in rows):
+        ordered = sorted(rows, key=lambda row: (row.get("rank") or 10**9, row.get("score") or 10**9))
+        chong = [row for row in ordered if (row.get("rank") or 10**9) < rank][:50]
+        wen = [row for row in ordered if rank <= (row.get("rank") or 10**9) <= int(rank * 1.3)][:50]
+        bao = [row for row in ordered if (row.get("rank") or 0) > int(rank * 1.3)][:50]
+        if chong or wen or bao:
+            return chong, wen, bao
+    if score > 0 and any((row.get("score") or 0) > 0 for row in rows):
+        ordered = sorted(rows, key=lambda row: (abs((row.get("score") or 0) - score), -(row.get("score") or 0)))
+        chong = [row for row in ordered if (row.get("score") or 0) > score][:50]
+        wen = [row for row in ordered if score - 25 <= (row.get("score") or 0) <= score + 25][:50]
+        bao = [row for row in ordered if 0 < (row.get("score") or 0) < score - 25][:50]
+        if chong or wen or bao:
+            return chong, wen, bao
+    ordered = sorted(rows, key=lambda row: ((row.get("rank") or 10**9), -(row.get("score") or 0)))
+    size = len(ordered)
+    split_1 = max(1, size // 3)
+    split_2 = max(split_1 + 1, (size * 2) // 3)
+    return ordered[:split_1], ordered[split_1:split_2], ordered[split_2:]
+
+
+def normalize_result_row(item):
+    normalized = dict(item)
+    major_text = (normalized.get("major") or "").strip()
+    if re.fullmatch(r"\d{2,4}", major_text):
+        normalized["major"] = f"专业组{major_text}"
+    elif not major_text:
+        normalized["major"] = "未细分专业"
+    normalized["school"] = (normalized.get("school") or "").strip()
+    return normalized
+
+
+def dedupe_rows(rows):
+    seen = set()
+    deduped = []
+    for row in rows or []:
+        normalized = normalize_result_row(row)
+        key = (
+            normalized.get("school") or "",
+            normalized.get("major") or "",
+            normalized.get("year") or "",
+            normalized.get("score") or 0,
+            normalized.get("rank") or 0,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+    return deduped
+
+
+def recommend_data(province="", major="", keyword="", rank=0, score=0, subject="", subject_detail=None):
     if province:
-        custom = recommend_by_user_data(province)
+        subject_detail = subject_detail or extract_subject_detail(subject)
+        custom = recommend_by_user_data(province, major=major, keyword=keyword, subject=subject, subject_detail=subject_detail)
         if custom:
             custom["rank"] = rank
             custom["score"] = score
+            custom.setdefault("match_mode", "custom")
+            custom.setdefault("semantic_terms", [])
             return custom
 
     if not HAS_DB or not province or not (rank > 0 or score > 0):
-        return {"rank": rank, "score": score, "chong": [], "wen": [], "bao": [], "source": "empty"}
+        return {"rank": rank, "score": score, "chong": [], "wen": [], "bao": [], "source": "empty", "match_mode": "empty", "semantic_terms": []}
 
     conn = sqlite3.connect(DB_PATH)
     base = "province LIKE ? AND (score>0 OR rank>0)"
     params = [f"%{province}%"]
-    subject_detail = extract_subject_detail(subject)
-    if subject:
-        base += " AND (category=? OR category='' OR category IS NULL)"
-        params.append(subject)
-    if major:
-        base += " AND major_name LIKE ?"
-        params.append(f"%{major}%")
-    if keyword:
-        keywords = [item for item in keyword.split(",") if item]
-        if keywords:
-            keyword_conditions = []
-            for item in keywords:
-                keyword_conditions.append("(major_name LIKE ? OR school_name LIKE ?)")
-                params.append(f"%{item}%")
-                params.append(f"%{item}%")
-            base += " AND (" + " OR ".join(keyword_conditions) + ")"
+    subject_detail = subject_detail or extract_subject_detail(subject)
+
+    def append_subject_clause(base_sql, sql_params):
+        if not subject:
+            return base_sql, list(sql_params)
+        next_sql = base_sql + " AND (category IS NULL OR category='' OR category='综合' OR category LIKE ? OR category LIKE ? OR category LIKE ?)"
+        next_params = list(sql_params)
+        if subject == "物理类":
+            next_params.extend(["%物理%", "%理科%", "%首选物理%"])
+        elif subject == "历史类":
+            next_params.extend(["%历史%", "%文科%", "%首选历史%"])
+        else:
+            next_params.extend(["%", "%", "%"])
+        return next_sql, next_params
+
+    base, params = append_subject_clause(base, params)
+
+    def append_terms_clause(base_sql, sql_params, terms):
+        terms = [term for term in terms or [] if term]
+        if not terms:
+            return base_sql, list(sql_params)
+        next_sql = base_sql
+        next_params = list(sql_params)
+        keyword_conditions = []
+        for item in terms:
+            keyword_conditions.append("(major_name LIKE ? OR school_name LIKE ?)")
+            next_params.append(f"%{item}%")
+            next_params.append(f"%{item}%")
+        next_sql += " AND (" + " OR ".join(keyword_conditions) + ")"
+        return next_sql, next_params
+
+    exact_terms = unique_list([term for term in [major] + str(keyword or "").split(",") if str(term).strip()])
+    relaxed_terms = build_major_search_terms(major=major, keyword=keyword)
 
     def rows_from_sql(sql, sql_params):
         rows = []
@@ -1141,127 +1668,127 @@ def recommend_data(province="", major="", keyword="", rank=0, score=0, subject="
                 "year": row[4],
                 "source": "db",
             }
-            if subject and not subject_requirement_compatible(subject, subject_detail, item["major"]):
+            if subject and not subject_requirement_compatible(subject, subject_detail, row[5] if len(row) > 5 else "", item["major"]):
                 continue
             rows.append(item)
-        return rows
+        return dedupe_rows(rows)
 
-    def filter_rows(rows):
-        filtered = []
-        for item in rows:
-            if subject and not subject_requirement_compatible(subject, subject_detail, item["major"]):
-                continue
-            filtered.append(item)
-        return filtered
+    def fetch_bucket_rows(query_base, query_params):
+        local_chong = []
+        local_wen = []
+        local_bao = []
+        if rank > 0:
+            local_chong = rows_from_sql(
+                f"SELECT school_name,major_name,score,rank,year,category FROM admission WHERE {query_base} "
+                "AND rank>0 AND rank<? AND rank>=? ORDER BY rank ASC LIMIT 50",
+                query_params + [rank, max(1, int(rank * 0.90))],
+            )
+            local_wen = rows_from_sql(
+                f"SELECT school_name,major_name,score,rank,year,category FROM admission WHERE {query_base} "
+                "AND rank>0 AND rank>=? AND rank<=? ORDER BY rank ASC LIMIT 50",
+                query_params + [rank, int(rank * 1.3)],
+            )
+            local_bao = rows_from_sql(
+                f"SELECT school_name,major_name,score,rank,year,category FROM admission WHERE {query_base} "
+                "AND rank>0 AND rank>? AND rank<=? ORDER BY rank ASC LIMIT 50",
+                query_params + [int(rank * 1.3), int(rank * 1.6)],
+            )
+        if not (local_chong or local_wen or local_bao) and score > 0:
+            local_chong = rows_from_sql(
+                f"SELECT school_name,major_name,score,rank,year,category FROM admission WHERE {query_base} "
+                "AND score>? AND score<=? ORDER BY score DESC LIMIT 80",
+                query_params + [score, score + 25],
+            )
+            local_wen = rows_from_sql(
+                f"SELECT school_name,major_name,score,rank,year,category FROM admission WHERE {query_base} "
+                "AND score>=? AND score<=? ORDER BY score ASC LIMIT 50",
+                query_params + [score - 25, score + 25],
+            )
+            local_bao = rows_from_sql(
+                f"SELECT school_name,major_name,score,rank,year,category FROM admission WHERE {query_base} "
+                "AND score>=? AND score<? ORDER BY score ASC LIMIT 50",
+                query_params + [score - 50, score - 25],
+            )
+        return local_chong, local_wen, local_bao
+
+    def fetch_nearest_rows(query_base, query_params):
+        if rank > 0:
+            rows = rows_from_sql(
+                f"SELECT school_name,major_name,score,rank,year,category FROM admission WHERE {query_base} "
+                "AND rank>0 ORDER BY ABS(rank-?) ASC LIMIT 120",
+                query_params + [rank],
+            )
+            if rows:
+                return rows
+        if score > 0:
+            return rows_from_sql(
+                f"SELECT school_name,major_name,score,rank,year,category FROM admission WHERE {query_base} "
+                "AND score>0 ORDER BY ABS(score-?) ASC LIMIT 120",
+                query_params + [score],
+            )
+        return []
 
     chong = []
     wen = []
     bao = []
+    match_mode = "province"
 
-    if rank > 0:
-        chong = rows_from_sql(
-            f"SELECT school_name,major_name,score,rank,year FROM admission WHERE {base} "
-            "AND rank>0 AND rank<? AND rank>=? ORDER BY rank ASC LIMIT 50",
-            params + [rank, max(1, int(rank * 0.90))],
-        )
-        wen = rows_from_sql(
-            f"SELECT school_name,major_name,score,rank,year FROM admission WHERE {base} "
-            "AND rank>0 AND rank>=? AND rank<=? ORDER BY rank ASC LIMIT 50",
-            params + [rank, int(rank * 1.3)],
-        )
-        bao = rows_from_sql(
-            f"SELECT school_name,major_name,score,rank,year FROM admission WHERE {base} "
-            "AND rank>0 AND rank>? AND rank<=? ORDER BY rank ASC LIMIT 50",
-            params + [int(rank * 1.3), int(rank * 1.6)],
-        )
+    exact_base, exact_params = append_terms_clause(base, params, exact_terms)
+    relaxed_base, relaxed_params = append_terms_clause(base, params, relaxed_terms)
+    plain_base, plain_params = base, list(params)
 
-    if not (chong or wen or bao) and keyword and rank > 0:
-        plain_params = [f"%{province}%"]
-        plain_base = "province LIKE ? AND (score>0 OR rank>0)"
-        if subject:
-            plain_base += " AND (category=? OR category='' OR category IS NULL)"
-            plain_params.append(subject)
-        chong = rows_from_sql(
-            f"SELECT school_name,major_name,score,rank,year FROM admission WHERE {plain_base} "
-            "AND rank>0 AND rank<? AND rank>=? ORDER BY rank ASC LIMIT 50",
-            plain_params + [rank, max(1, int(rank * 0.90))],
-        )
-        wen = rows_from_sql(
-            f"SELECT school_name,major_name,score,rank,year FROM admission WHERE {plain_base} "
-            "AND rank>0 AND rank>=? AND rank<=? ORDER BY rank ASC LIMIT 50",
-            plain_params + [rank, int(rank * 1.3)],
-        )
-        bao = rows_from_sql(
-            f"SELECT school_name,major_name,score,rank,year FROM admission WHERE {plain_base} "
-            "AND rank>0 AND rank>? AND rank<=? ORDER BY rank ASC LIMIT 50",
-            plain_params + [int(rank * 1.3), int(rank * 1.6)],
-        )
+    for label, query_base, query_params in [
+        ("exact", exact_base, exact_params),
+        ("semantic", relaxed_base, relaxed_params),
+        ("province", plain_base, plain_params),
+    ]:
+        chong, wen, bao = fetch_bucket_rows(query_base, query_params)
+        if chong or wen or bao:
+            match_mode = label
+            break
+    if not (chong or wen or bao):
+        nearest_rows = fetch_nearest_rows(plain_base, plain_params)
+        chong, wen, bao = bucket_rows_for_target(nearest_rows, rank=rank, score=score)
+        if chong or wen or bao:
+            match_mode = "nearest"
 
     only_major_group_result = False
     if major and province == "江苏":
         group_rows = []
         major_group_base = "province LIKE ? AND (score>0 OR rank>0)"
         major_group_params = [f"%{province}%"]
-        if subject:
-            major_group_base += " AND (category=? OR category='' OR category IS NULL)"
-            major_group_params.append(subject)
+        major_group_base, major_group_params = append_subject_clause(major_group_base, major_group_params)
         if rank > 0:
             group_rows = rows_from_sql(
-                f"SELECT school_name,major_name,score,rank,year FROM admission WHERE {major_group_base} "
+                f"SELECT school_name,major_name,score,rank,year,category FROM admission WHERE {major_group_base} "
                 "AND rank>0 AND rank>=? AND rank<=? ORDER BY rank ASC LIMIT 120",
                 major_group_params + [max(1, int(rank * 0.90)), int(rank * 1.6)],
             )
         elif score > 0:
             group_rows = rows_from_sql(
-                f"SELECT school_name,major_name,score,rank,year FROM admission WHERE {major_group_base} "
+                f"SELECT school_name,major_name,score,rank,year,category FROM admission WHERE {major_group_base} "
                 "AND score>=? AND score<=? ORDER BY score ASC LIMIT 120",
                 major_group_params + [score - 50, score + 25],
             )
         group_rows = [row for row in group_rows if is_major_group_text(row.get("major"))]
         if group_rows:
             only_major_group_result = True
-            chong, wen, bao = [], [], []
-
-    if not only_major_group_result and not (chong or wen or bao) and score > 0:
-        chong = rows_from_sql(
-            f"SELECT school_name,major_name,score,rank,year FROM admission WHERE {base} "
-            "AND score>? AND score<=? ORDER BY score DESC LIMIT 80",
-            params + [score, score + 25],
-        )
-        wen = rows_from_sql(
-            f"SELECT school_name,major_name,score,rank,year FROM admission WHERE {base} "
-            "AND score>=? AND score<=? ORDER BY score ASC LIMIT 50",
-            params + [score - 25, score + 25],
-        )
-        bao = rows_from_sql(
-            f"SELECT school_name,major_name,score,rank,year FROM admission WHERE {base} "
-            "AND score>=? AND score<? ORDER BY score ASC LIMIT 50",
-            params + [score - 50, score - 25],
-        )
-        if not (chong or wen or bao):
-            plain_base = "province LIKE ? AND (score>0 OR rank>0)"
-            plain_params = [f"%{province}%"]
-            if subject:
-                plain_base += " AND (category=? OR category='' OR category IS NULL)"
-                plain_params.append(subject)
-            chong = rows_from_sql(
-                f"SELECT school_name,major_name,score,rank,year FROM admission WHERE {plain_base} "
-                "AND score>? AND score<=? ORDER BY score DESC LIMIT 80",
-                plain_params + [score, score + 25],
-            )
-            wen = rows_from_sql(
-                f"SELECT school_name,major_name,score,rank,year FROM admission WHERE {plain_base} "
-                "AND score>=? AND score<=? ORDER BY score ASC LIMIT 50",
-                plain_params + [score - 25, score + 25],
-            )
-            bao = rows_from_sql(
-                f"SELECT school_name,major_name,score,rank,year FROM admission WHERE {plain_base} "
-                "AND score>=? AND score<? ORDER BY score ASC LIMIT 50",
-                plain_params + [score - 50, score - 25],
-            )
+            chong, wen, bao = bucket_rows_for_target(group_rows, rank=rank, score=score)
+            match_mode = "province"
 
     conn.close()
-    return {"rank": rank, "score": score, "chong": chong, "wen": wen, "bao": bao, "source": "db"}
+    if match_mode == "province" and exact_terms and (chong or wen or bao):
+        match_mode = "direct"
+    return {
+        "rank": rank,
+        "score": score,
+        "chong": chong,
+        "wen": wen,
+        "bao": bao,
+        "source": "db",
+        "match_mode": match_mode,
+        "semantic_terms": [],
+    }
 
 
 def baidu_search(query, limit=5):
@@ -1372,6 +1899,10 @@ def build_evidence(info, recommendations, web_findings):
     total_db = sum(len(recommendations.get(bucket) or []) for bucket in ["chong", "wen", "bao"])
     if total_db:
         summary.append(f"本地数据库找到了 {total_db} 条相对匹配的学校和专业。")
+        if recommendations.get("match_mode") == "semantic" and recommendations.get("semantic_terms"):
+            summary.append(f"直接关键词没命中后，我又用 AI 补了这些相近检索词：{','.join(recommendations.get('semantic_terms') or [])}。")
+        elif recommendations.get("match_mode") in ("province", "nearest", "direct"):
+            summary.append("这次结果里包含一部分省内兜底数据，命中精度会比直接专业匹配弱一些。")
     else:
         summary.append("本地数据库里暂时没有命中足够多的匹配结果。")
         if info.get("province") and info.get("majors"):
@@ -1422,6 +1953,8 @@ def build_messages(mode, info, evidence, history, user_message):
         profile_parts.append(f"分数：{info.get('score') or '未提供'}")
         profile_parts.append(f"位次：{info.get('rank') or '未提供'}")
         profile_parts.append(f"选科：{info.get('subject') or '未提供'}")
+        if info.get("subject_detail"):
+            profile_parts.append(f"选科细项：{','.join(info.get('subject_detail') or [])}")
         if info.get("majors"):
             profile_parts.append(f"意向专业：{','.join(info.get('majors') or [])}")
         elif info.get("major_unknown"):
@@ -1606,26 +2139,35 @@ class Handler(BaseHTTPRequestHandler):
             emit({"type": "phase", "text": "正在整理你刚才提供的信息..."})
 
             plan_state = ensure_plan_state(mode, planner)
-            try:
-                extracted = ai_extract_fields(
-                    mode,
-                    message,
-                    history,
-                    plan_state.get("current_questions") or [],
-                    plan_state.get("collected") or {},
-                    config,
+            # 正则/字典优先，匹配不到再调 AI
+            extracted = fallback_extract_info(mode, message, plan_state.get("current_questions") or [])
+            if mode == "gaokao":
+                regex_got_something = bool(
+                    extracted.get("province") or extracted.get("score") or extracted.get("rank")
+                    or extracted.get("subject") or extracted.get("majors") or extracted.get("major_unknown")
                 )
-            except Exception:
-                extracted = {}
-            if not extracted:
-                extracted = fallback_extract_info(mode, message, plan_state.get("current_questions") or [])
+            else:
+                regex_got_something = bool(extracted.get("topic") or extracted.get("goal"))
+            if not regex_got_something:
+                # 正则打不中 → 调 AI 提取
+                try:
+                    ai_result = ai_extract_fields(
+                        mode, message, history,
+                        plan_state.get("current_questions") or [],
+                        plan_state.get("collected") or {},
+                        config,
+                    )
+                    if ai_result:
+                        extracted = ai_result
+                except Exception:
+                    pass
             plan_state["collected"] = merge_collected_for_mode(mode, plan_state["collected"], extracted)
             plan_state["last_user_message"] = message
             plan_state = prune_answered_questions(mode, plan_state)
 
             plan_enabled = bool(planner.get("enabled"))
             if planner_should_ask(mode, plan_enabled, plan_state, message):
-                question_payload = build_question_response(mode, plan_state)
+                question_payload = build_question_response(mode, plan_state, config=config, history=history, message=message)
                 plan_state = question_payload["planState"]
                 emit(question_payload)
                 emit({"type": "done", "kind": "question", "planState": plan_state})
@@ -1649,7 +2191,39 @@ class Handler(BaseHTTPRequestHandler):
                     rank=collected.get("rank", 0),
                     score=collected.get("score", 0),
                     subject=collected.get("subject", ""),
+                    subject_detail=collected.get("subject_detail", []),
                 )
+                total_rows = sum(len(recommendations.get(bucket) or []) for bucket in ["chong", "wen", "bao"])
+                should_try_semantic = total_rows == 0 or (
+                    recommendations.get("match_mode") in ("province", "nearest", "direct") and bool(collected.get("majors"))
+                )
+                if should_try_semantic:
+                    semantic_terms = []
+                    try:
+                        semantic_terms = ai_expand_retrieval_terms(collected, history, config)
+                    except Exception:
+                        semantic_terms = []
+                    if semantic_terms:
+                        emit({"type": "phase", "text": "正在用 AI 补全相近专业词后再试一次..."})
+                        merged_keyword = ",".join(unique_list((collected.get("majors") or []) + semantic_terms))
+                        fallback_recommendations = recommendations
+                        recommendations = recommend_data(
+                            province=collected.get("province", ""),
+                            major=(collected.get("majors") or [""])[0] if collected.get("majors") else "",
+                            keyword=merged_keyword,
+                            rank=collected.get("rank", 0),
+                            score=collected.get("score", 0),
+                            subject=collected.get("subject", ""),
+                            subject_detail=collected.get("subject_detail", []),
+                        )
+                        semantic_total = sum(len(recommendations.get(bucket) or []) for bucket in ["chong", "wen", "bao"])
+                        if semantic_total:
+                            recommendations["semantic_terms"] = semantic_terms
+                            recommendations["match_mode"] = "semantic"
+                        else:
+                            recommendations = fallback_recommendations
+                            recommendations["semantic_terms"] = semantic_terms
+                            recommendations["match_mode"] = recommendations.get("match_mode", "province")
 
                 emit({"type": "phase", "text": "正在补充联网参考信息..."})
                 queries = build_search_queries(collected, recommendations)
