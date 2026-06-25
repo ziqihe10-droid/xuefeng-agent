@@ -912,8 +912,11 @@ def contextual_extract_fields(mode, text, current_questions):
         for field in current_questions:
             if field == "guardrails" and compact:
                 result["guardrails"] = [text.strip()]
-            elif field in {"topic", "goal", "style"} and compact and compact not in {"不知道", "我也不知道", "没想好"}:
-                result[field] = text.strip()
+            elif field in {"topic", "goal", "style"} and compact:
+                if compact in {"不知道", "我也不知道", "没想好", "都行", "随便"}:
+                    result[field] = "未指定"
+                else:
+                    result[field] = text.strip()
         return result
 
     for field in current_questions:
@@ -958,16 +961,22 @@ def contextual_extract_fields(mode, text, current_questions):
                 result["region_pref"] = region_pref
             elif compact in {"省内", "本省", "省外", "外省"}:
                 result["region_pref"] = [compact]
+            elif compact in {"不知道", "我也不知道", "没想好", "都行", "随便", "无偏好"}:
+                result["region_pref"] = ["无偏好"]
             if region_avoid:
                 result["region_avoid"] = region_avoid
         elif field == "career_goal":
             career_goal = extract_career_goal(text)
             if career_goal:
                 result["career_goal"] = career_goal
+            elif compact in {"不知道", "我也不知道", "没想好", "还没想好", "都行", "随便", "再说"}:
+                result["career_goal"] = "未定"
         elif field == "budget":
             budget = extract_budget_text(text, contextual=True)
             if budget:
                 result["budget"] = budget
+            elif compact in {"不知道", "我也不知道", "没想好", "都行", "随便", "正常", "普通"}:
+                result["budget"] = "正常预算"
     return result
 
 
@@ -1515,16 +1524,19 @@ def should_skip_field(mode, state, field):
 
 
 def planner_should_ask(mode, plan_enabled, state, message):
-    # gaokao 模式：必填字段不全时无视 plan 开关，必须追问到底
-    if mode == "gaokao":
-        missing = determine_missing_fields(mode, state["collected"])
-        effective_missing = [field for field in missing if not should_skip_field(mode, state, field)]
-        core_missing = [field for field in required_fields_for_mode(mode) if field in effective_missing]
-        return bool(core_missing)
-    if not plan_enabled:
-        return False
     missing = determine_missing_fields(mode, state["collected"])
     effective_missing = [field for field in missing if not should_skip_field(mode, state, field)]
+    if mode == "gaokao":
+        # 必填字段不全：无视 plan 开关，必须追问
+        core_missing = [field for field in required_fields_for_mode(mode) if field in effective_missing]
+        if core_missing:
+            return True
+        # 必填已全，可选字段：看 plan 开关
+        if plan_enabled and effective_missing:
+            return True
+        return False
+    if not plan_enabled:
+        return False
     stripped = message.strip()
     if len(stripped) < 8:
         return bool(effective_missing)
