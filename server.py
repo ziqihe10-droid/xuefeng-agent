@@ -75,6 +75,9 @@ SUBJECT_DETAIL_ABBR_MAP = {
     "史地政": ["历史", "地理", "政治"],
     "历政地": ["历史", "政治", "地理"],
     "历地政": ["历史", "地理", "政治"],
+    "政史地": ["政治", "历史", "地理"],
+    "政地史": ["政治", "地理", "历史"],
+    "地政史": ["地理", "政治", "历史"],
 }
 
 # 当 DB 的 category 为空/综合时，用专业名关键词判断文理倾向
@@ -153,16 +156,17 @@ FUN_REQUIRED_FIELDS = ["topic", "goal"]
 FUN_OPTIONAL_FIELDS = ["style", "guardrails"]
 
 FIELD_MAX_ATTEMPTS = {
-    "province": 2,
-    "score_or_rank": 2,
-    "subject": 2,
-    "majors": 1,
-    "accept_adjustment": 2,
-    "region_pref": 1,
-    "career_goal": 1,
-    "budget": 1,
-    "topic": 1,
-    "goal": 1,
+    "province": 3,
+    "score_or_rank": 3,
+    "subject": 3,
+    "subject_detail": 2,
+    "majors": 3,
+    "accept_adjustment": 3,
+    "region_pref": 2,
+    "career_goal": 2,
+    "budget": 2,
+    "topic": 2,
+    "goal": 2,
     "style": 1,
     "guardrails": 1,
 }
@@ -1375,10 +1379,12 @@ def merge_collected(current, incoming):
                 merged[key] = value.strip()
         else:
             merged[key] = value
-    if incoming.get("majors"):
+    if incoming.get("majors") and not incoming.get("major_unknown"):
+        # 有专业且用户没有明确说"不知道"→ 采纳
         merged["majors"] = unique_list(incoming.get("majors") or [])
         merged["major_unknown"] = False
     elif incoming.get("major_unknown") is True:
+        # 用户明确说不知道学什么 → 清空正则误提的专业（如选了物化生→"生物"）
         merged["major_unknown"] = True
         merged["majors"] = []
     incoming_subject = (incoming.get("subject") or "").strip() if isinstance(incoming.get("subject"), str) else ""
@@ -1502,17 +1508,23 @@ def should_skip_field(mode, state, field):
     limit = FIELD_MAX_ATTEMPTS.get(field, 1)
     if attempts < limit:
         return False
-    return field in optional_fields_for_mode(mode) or field == "majors"
+    # 必填字段多给一次机会追问，之后才跳过（避免无限循环）
+    if field in required_fields_for_mode(mode) and attempts == limit:
+        return False
+    return True
 
 
 def planner_should_ask(mode, plan_enabled, state, message):
+    # gaokao 模式：必填字段不全时无视 plan 开关，必须追问到底
+    if mode == "gaokao":
+        missing = determine_missing_fields(mode, state["collected"])
+        effective_missing = [field for field in missing if not should_skip_field(mode, state, field)]
+        core_missing = [field for field in required_fields_for_mode(mode) if field in effective_missing]
+        return bool(core_missing)
     if not plan_enabled:
         return False
     missing = determine_missing_fields(mode, state["collected"])
     effective_missing = [field for field in missing if not should_skip_field(mode, state, field)]
-    if mode == "gaokao":
-        core_missing = [field for field in required_fields_for_mode(mode) if field in effective_missing]
-        return bool(core_missing)
     stripped = message.strip()
     if len(stripped) < 8:
         return bool(effective_missing)
@@ -1535,6 +1547,13 @@ def select_questions(mode, state):
             continue
         selected.append(field)
         if len(selected) >= 2:
+            break
+    # 所有可选字段都问过了 → 允许从 still-missing 的必填字段中重问
+    if not selected:
+        for field in priority:
+            if field not in available:
+                continue
+            selected.append(field)
             break
     return selected
 
