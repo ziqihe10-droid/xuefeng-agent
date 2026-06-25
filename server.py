@@ -77,6 +77,63 @@ SUBJECT_DETAIL_ABBR_MAP = {
     "历地政": ["历史", "地理", "政治"],
 }
 
+# 当 DB 的 category 为空/综合时，用专业名关键词判断文理倾向
+# 历史类用户不应被推荐这些明显仅限物理类的专业
+STEM_MAJOR_KEYWORDS = [
+    "工程", "电气", "机械", "材料", "化工", "土木", "计算机科学", "软件",
+    "人工智能", "大数据", "数据科学", "网络工程", "信息安全", "物联网",
+    "自动化", "电子", "通信", "智能制造", "机器人", "微电子", "集成电路",
+    "冶金", "采矿", "测绘", "水利", "能源", "地质", "石油", "船舶",
+    "车辆", "航空", "航天", "力学", "建筑", "城乡规划", "风景园林",
+    "生物科学", "生物技术", "生物工程", "生物医学", "生物制药",
+    "物理学", "应用物理", "化学", "应用化学", "数学与应用数学",
+    "信息与计算", "信息管理", "统计学", "应用统计",
+    "光电", "测控", "给排水", "包装", "印刷", "纺织", "轻化",
+    "核工程", "兵器", "弹药", "探测制导",
+]
+# 如果专业名包含以下关键词，大概率是文科/文理兼收，历史类用户放行
+LIBERAL_ARTS_MAJOR_KEYWORDS = [
+    "法学", "法律", "知识产权", "社会工作", "社会学",
+    "新闻", "传播", "广告", "编辑", "出版", "网络与新媒体",
+    "汉语言", "汉语", "英语", "日语", "俄语", "德语", "法语", "韩语",
+    "翻译", "商务英语", "外国语言", "中国语言", "古典文献",
+    "历史", "考古", "文物", "哲学", "宗教", "逻辑",
+    "政治", "行政", "公共管理", "马克思主义", "思想政治教育", "国际政治",
+    "教育", "师范", "学前", "小学教育", "特殊教育", "心理学",
+    "会计", "财务", "审计", "金融", "经济", "财政", "税务",
+    "国际贸易", "工商管理", "市场营销", "人力资源", "物流管理",
+    "旅游管理", "酒店管理", "会展", "文化产业管理", "公共事业管理",
+    "法学", "知识产权", "监狱学",
+    "设计", "美术", "音乐", "舞蹈", "戏剧", "影视", "播音",
+    "编导", "表演", "书法", "摄影", "动画", "数字媒体艺术",
+    "护理", "助产", "康复治疗", "中药", "针灸", "推拿", "中医",
+    "预防医学", "卫生检验", "医学检验", "医学实验",
+    "体育", "运动", "武术",
+]
+
+def _category_unknown_major_suitable(subject, major_name):
+    """当 DB 的 category 为空/综合时，用专业名关键词粗略判断文理兼容性。"""
+    if subject not in ("物理类", "历史类"):
+        return True
+    major_name = major_name or ""
+    if subject == "历史类":
+        # 师范类标记：即使含 STEM 关键词，加了师范也可能是文理兼收
+        has_teacher_tag = "师范" in major_name
+        # 先查理工关键词，命中就过滤（除了带师范标记的）
+        for kw in STEM_MAJOR_KEYWORDS:
+            if kw in major_name:
+                if has_teacher_tag:
+                    return True  # 数学师范、物理师范等文理兼收
+                return False
+        # 再看文科关键词，命中就放行
+        for kw in LIBERAL_ARTS_MAJOR_KEYWORDS:
+            if kw in major_name:
+                return True
+        # 都没命中 → 不确定，放行（宁可多推不少推）
+        return True
+    # 物理类：大部分专业都能报，不过滤
+    return True
+
 GAOKAO_PRIORITY = [
     "province",
     "score_or_rank",
@@ -693,6 +750,9 @@ def subject_requirement_compatible(subject, subject_detail, category, major_name
 
     required = extract_requirement_subjects(major_name)
     if not required:
+        # category 为空/综合时，用专业名关键词做文理判断
+        if subject in ("物理类", "历史类") and category_subject in ("", "综合"):
+            return _category_unknown_major_suitable(subject, major_name)
         return True
 
     detail_set = set(subject_detail or [])
