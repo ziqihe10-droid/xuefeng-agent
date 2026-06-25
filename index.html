@@ -301,6 +301,13 @@ details.evidence summary{
   font-weight:700;
   background:var(--card2);
   border-bottom:1px solid var(--bdr);
+  cursor:pointer;
+  user-select:none;
+  list-style:none;
+}
+.volunteer-table-head::-webkit-details-marker{display:none}
+.volunteer-table[open] .volunteer-table-head{
+  border-bottom:1px solid var(--bdr);
 }
 .volunteer-table-wrap{
   overflow-x:auto;
@@ -993,8 +1000,15 @@ function volunteerTableHtml(evidence){
     if(level === '稳') return 'wen';
     return 'bao';
   }
-  var html = '<div class="volunteer-table">';
-  html += '<div class="volunteer-table-head">志愿推荐表</div>';
+  var chongCount = 0, wenCount = 0, baoCount = 0;
+  rows.forEach(function(r){
+    if(r.level === '冲') chongCount++;
+    else if(r.level === '稳') wenCount++;
+    else baoCount++;
+  });
+  var summaryText = '志愿推荐表（冲'+chongCount+' · 稳'+wenCount+' · 保'+baoCount+'）';
+  var html = '<details class="volunteer-table">';
+  html += '<summary class="volunteer-table-head">'+escapeHtml(summaryText)+'</summary>';
   html += '<div class="volunteer-table-wrap"><table>';
   html += '<thead><tr><th>档位</th><th>学校</th><th>专业</th><th>年份</th><th>最低分</th><th>位次</th><th>来源</th></tr></thead><tbody>';
   rows.forEach(function(row){
@@ -1008,7 +1022,7 @@ function volunteerTableHtml(evidence){
     html += '<td class="volunteer-meta">'+escapeHtml(row.source || '')+'</td>';
     html += '</tr>';
   });
-  html += '</tbody></table></div></div>';
+  html += '</tbody></table></div></details>';
   return html;
 }
 
