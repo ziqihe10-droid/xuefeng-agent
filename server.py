@@ -228,6 +228,51 @@ JSON 模板：
 {"terms":[],"reason":""}
 """
 
+EXTRACT_VERIFY_PROMPT = """你是一个信息提取验证器。你的任务不是提取新信息，而是检查已有的提取结果是否正确。
+
+你会收到：
+- 用户的原始消息
+- 系统用正则/字典提取出的字段
+- 已有的上下文信息
+
+你需要逐项检查提取结果有没有这些错误：
+1. 张冠李戴：把选科当成专业（比如用户说"选了物化生"，不应提取"生物"为专业）、把日常用词当成字段（比如"老师说"不应提取"师范"）
+2. 遗漏：用户明确说了的信息没提取到
+3. 矛盾：提取结果和已有上下文冲突
+4. 数字错误：分数/位次解析错了
+
+输出规则：
+1. 只能输出一个 JSON 对象。
+2. correct 是 bool：true 表示提取结果没问题可以直接用，false 表示有问题需要修正。
+3. issues 是字符串数组，列出每个具体问题。没有问题时为空数组。
+4. 不要输出解释或 Markdown。
+
+JSON 模板：
+{"correct":true,"issues":[]}
+"""
+
+EXTRACT_FIX_PROMPT = """你是一个信息提取修正器。原始提取有错误，你需要根据用户消息和上下文重新提取正确的字段。
+
+输出规则：
+1. 只能输出一个 JSON 对象，不能输出解释，不能输出 Markdown。
+2. 结合 mode、current_questions、collected、history 来理解用户这一轮输入。
+3. 如果用户没有否定旧信息，就不要清空旧信息。
+4. 如果用户明确表示"不知道想学什么""专业没想好""我也不知道学什么"，请返回 major_unknown=true，并把 majors 设为空数组。
+5. 如果用户只是说"我也不知道"，要结合 current_questions 判断是在回答哪个问题。
+6. accept_adjustment 只能是 true、false 或 null。
+7. score 和 rank 只填数字，没有就填 0。
+8. subject 只允许：物理类、历史类、综合。
+9. subject_detail 必须是数组，优先返回更细的选科。
+10. career_goal 尽量归一为：考研、直接就业、考公、考编；无法判断就留空。
+11. budget 保留成适合展示的简短中文。
+12. majors、schools、region_pref、region_avoid、guardrails 必须是数组。
+13. thinking_mode 固定返回 false。
+14. 修正时特别注意：不要把选科描述当成专业（"选了物化生"中的化学/生物不是专业），不要把日常对话中的职业称呼当成专业意向（"老师说"不是想当老师，"医生说"不是想当医生，除非明确说"想当医生""想做老师"）。
+
+JSON 模板：
+{"province":"","score":0,"rank":0,"subject":"","subject_detail":[],"majors":[],"major_unknown":false,"schools":[],"accept_adjustment":null,"region_pref":[],"region_avoid":[],"career_goal":"","budget":"","topic":"","goal":"","style":"","guardrails":[],"thinking_mode":false}
+"""
+
 
 def clean_num(value):
     if value is None:
@@ -1079,6 +1124,88 @@ def ai_extract_fields(mode, message, history, current_questions, collected, conf
     content = content.replace("```json", "").replace("```", "").strip()
     parsed = safe_json_loads(content, {})
     return normalize_extracted_fields(mode, parsed)
+
+
+def _ai_call_json(prompt, user_content, config, max_tokens=320, temperature=0):
+    """通用 AI JSON 调用：发送 prompt + user_content，返回解析后的 dict。失败返回 None。"""
+    api_key = (config.get("key") or "").strip()
+    api_url = (config.get("url") or "https://api.deepseek.com").strip().rstrip("/")
+    if not api_key:
+        return None
+    model = normalize_model_name(config.get("model"))
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": json.dumps(user_content, ensure_ascii=False)},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "thinking": {"type": "disabled"},
+    }
+    request = urllib.request.Request(
+        api_url + "/v1/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=35) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+    content = content.replace("```json", "").replace("```", "").strip()
+    return safe_json_loads(content)
+
+
+def ai_verify_extraction(mode, message, regex_extracted, collected, history, config):
+    """AI 验证正则提取结果是否正确。返回 {"correct": bool, "issues": [...]}。失败返回 None 视为通过。"""
+    if not (config.get("key") or "").strip():
+        return None
+    try:
+        result = _ai_call_json(
+            EXTRACT_VERIFY_PROMPT,
+            {
+                "mode": mode,
+                "message": message,
+                "regex_extracted": regex_extracted,
+                "collected": collected or {},
+                "history": (history or [])[-6:],
+            },
+            config,
+            max_tokens=200,
+            temperature=0,
+        )
+        if isinstance(result, dict) and "correct" in result:
+            return {"correct": bool(result.get("correct")), "issues": result.get("issues") or []}
+    except Exception:
+        pass
+    return None
+
+
+def ai_fix_extraction(mode, message, regex_extracted, issues, collected, history, config):
+    """AI 修正提取结果。返回修正后的字段 dict，失败返回 None。"""
+    if not (config.get("key") or "").strip():
+        return None
+    try:
+        result = _ai_call_json(
+            EXTRACT_FIX_PROMPT,
+            {
+                "mode": mode,
+                "message": message,
+                "regex_extracted": regex_extracted,
+                "issues": issues or [],
+                "current_questions": [],
+                "collected": collected or {},
+                "history": (history or [])[-8:],
+            },
+            config,
+            max_tokens=400,
+            temperature=0,
+        )
+        if isinstance(result, dict):
+            return normalize_extracted_fields(mode, result)
+    except Exception:
+        pass
+    return None
 
 
 def ai_expand_retrieval_terms(collected, history, config):
@@ -2161,6 +2288,22 @@ class Handler(BaseHTTPRequestHandler):
                         extracted = ai_result
                 except Exception:
                     pass
+            else:
+                # 正则打中了 → AI 验证，有问题则 AI 修正
+                verify_result = ai_verify_extraction(
+                    mode, message, extracted,
+                    plan_state.get("collected") or {},
+                    history, config,
+                )
+                if verify_result is not None and not verify_result.get("correct"):
+                    issues = verify_result.get("issues") or []
+                    fixed = ai_fix_extraction(
+                        mode, message, extracted, issues,
+                        plan_state.get("collected") or {},
+                        history, config,
+                    )
+                    if fixed:
+                        extracted = fixed
             plan_state["collected"] = merge_collected_for_mode(mode, plan_state["collected"], extracted)
             plan_state["last_user_message"] = message
             plan_state = prune_answered_questions(mode, plan_state)
