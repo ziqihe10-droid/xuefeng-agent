@@ -505,7 +505,7 @@ def extract_xlsx_rows(path):
 
 
 def append_user_data_record(school, major, category, province, score, rank, year):
-    if not school or score is None or rank is None:
+    if not school or (score is None and rank is None):
         return
     USER_DATA.append({
         "school": school,
